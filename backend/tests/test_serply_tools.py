@@ -2,10 +2,12 @@
 
 import json
 import logging
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+
+pytestmark = pytest.mark.anyio
 
 
 @pytest.fixture(autouse=True)
@@ -56,10 +58,22 @@ def _search_rows(n: int) -> list[dict]:
     return [{"title": f"Result {i}", "link": f"https://example.com/{i}", "description": f"Snippet {i}", "position": i} for i in range(1, n + 1)]
 
 
-def _run(query: str = "test query", max_results: int = 5) -> dict:
+def _patch_client(mock_resp: MagicMock):
+    """Patch httpx.AsyncClient so the context-managed ``get`` returns ``mock_resp``."""
+    patcher = patch("deerflow.community.serply.tools.httpx.AsyncClient")
+    mock_client_cls = patcher.start()
+    mock_client_cls.return_value.__aenter__.return_value.get = AsyncMock(return_value=mock_resp)
+    return patcher, mock_client_cls
+
+
+def _get_call(mock_client_cls):
+    return mock_client_cls.return_value.__aenter__.return_value.get.call_args
+
+
+async def _run(query: str = "test query", max_results: int = 5) -> dict:
     from deerflow.community.serply.tools import web_search_tool
 
-    return json.loads(web_search_tool.invoke({"query": query, "max_results": max_results}))
+    return json.loads(await web_search_tool.ainvoke({"query": query, "max_results": max_results}))
 
 
 class TestGetApiKey:
@@ -141,56 +155,61 @@ class TestCoerceVertical:
 
 
 class TestWebSearchTool:
-    def test_basic_search_returns_normalized_results(self, mock_config_with_key):
-        with patch("deerflow.community.serply.tools.httpx.Client") as mock_client:
-            mock_client.return_value.__enter__.return_value.get.return_value = _make_response({"results": _search_rows(2)})
-            result = _run("test query")
+    async def test_basic_search_returns_normalized_results(self, mock_config_with_key):
+        patcher, _ = _patch_client(_make_response({"results": _search_rows(2)}))
+        try:
+            result = await _run("test query")
+        finally:
+            patcher.stop()
 
         assert result["query"] == "test query"
         assert result["total_results"] == 2
         assert result["results"][0] == {"title": "Result 1", "url": "https://example.com/1", "content": "Snippet 1"}
 
-    def test_sends_correct_headers_and_params(self, mock_config_with_key):
-        with patch("deerflow.community.serply.tools.httpx.Client") as mock_client:
-            mock_get = mock_client.return_value.__enter__.return_value.get
-            mock_get.return_value = _make_response({"results": _search_rows(1)})
-            _run("  padded query  ")
+    async def test_sends_correct_headers_and_params(self, mock_config_with_key):
+        patcher, mock_client_cls = _patch_client(_make_response({"results": _search_rows(1)}))
+        try:
+            await _run("  padded query  ")
+            call = _get_call(mock_client_cls)
+        finally:
+            patcher.stop()
 
-        args, kwargs = mock_get.call_args
-        assert args[0] == "https://api.serply.io/v1/search/"
-        assert kwargs["headers"]["X-Api-Key"] == "test-serply-key"
-        assert kwargs["headers"]["Accept"] == "application/json"
-        assert kwargs["params"] == {"q": "padded query", "num": 5}
+        assert call.args[0] == "https://api.serply.io/v1/search/"
+        assert call.kwargs["headers"]["X-Api-Key"] == "test-serply-key"
+        assert call.kwargs["headers"]["Accept"] == "application/json"
+        assert call.kwargs["params"] == {"q": "padded query", "num": 5}
 
-    def test_config_max_results_overrides_parameter(self):
+    async def test_config_max_results_overrides_parameter(self):
         patcher, _ = _patch_config({"api_key": "k", "max_results": 2})
         try:
-            with patch("deerflow.community.serply.tools.httpx.Client") as mock_client:
-                mock_get = mock_client.return_value.__enter__.return_value.get
-                mock_get.return_value = _make_response({"results": _search_rows(5)})
-                result = _run("q", max_results=5)
+            client_patcher, mock_client_cls = _patch_client(_make_response({"results": _search_rows(5)}))
+            try:
+                result = await _run("q", max_results=5)
+            finally:
+                client_patcher.stop()
         finally:
             patcher.stop()
 
-        assert mock_get.call_args.kwargs["params"]["num"] == 2
+        assert _get_call(mock_client_cls).kwargs["params"]["num"] == 2
         assert result["total_results"] == 2
 
-    def test_passes_through_locale_params_from_config(self):
+    async def test_passes_through_locale_params_from_config(self):
         patcher, _ = _patch_config({"api_key": "k", "gl": "fr", "hl": "fr", "ignored": "x"})
         try:
-            with patch("deerflow.community.serply.tools.httpx.Client") as mock_client:
-                mock_get = mock_client.return_value.__enter__.return_value.get
-                mock_get.return_value = _make_response({"results": _search_rows(1)})
-                _run("q")
+            client_patcher, mock_client_cls = _patch_client(_make_response({"results": _search_rows(1)}))
+            try:
+                await _run("q")
+            finally:
+                client_patcher.stop()
         finally:
             patcher.stop()
 
-        params = mock_get.call_args.kwargs["params"]
+        params = _get_call(mock_client_cls).kwargs["params"]
         assert params["gl"] == "fr"
         assert params["hl"] == "fr"
         assert "ignored" not in params
 
-    def test_news_vertical_uses_news_endpoint_and_trims_client_side(self):
+    async def test_news_vertical_uses_news_endpoint_and_trims_client_side(self):
         entries = [
             {
                 "title": f"Story {i}",
@@ -203,21 +222,22 @@ class TestWebSearchTool:
         ]
         patcher, _ = _patch_config({"api_key": "k", "max_results": 3, "vertical": "news"})
         try:
-            with patch("deerflow.community.serply.tools.httpx.Client") as mock_client:
-                mock_get = mock_client.return_value.__enter__.return_value.get
-                mock_get.return_value = _make_response({"entries": entries})
-                result = _run("q")
+            client_patcher, mock_client_cls = _patch_client(_make_response({"entries": entries}))
+            try:
+                result = await _run("q")
+            finally:
+                client_patcher.stop()
         finally:
             patcher.stop()
 
-        assert mock_get.call_args.args[0] == "https://api.serply.io/v1/news/"
+        assert _get_call(mock_client_cls).args[0] == "https://api.serply.io/v1/news/"
         assert result["total_results"] == 3
         first = result["results"][0]
         assert first["content"] == "Genuine\xa0attention & chatbots"
         assert first["published"] == "Mon, 01 Jun 2026 08:00:00 GMT"
         assert first["source"] == "Example Times"
 
-    def test_scholar_vertical_maps_authors_and_citations(self):
+    async def test_scholar_vertical_maps_authors_and_citations(self):
         articles = [
             {
                 "title": "Attention Is All You Need",
@@ -234,60 +254,72 @@ class TestWebSearchTool:
         ]
         patcher, _ = _patch_config({"api_key": "k", "vertical": "scholar"})
         try:
-            with patch("deerflow.community.serply.tools.httpx.Client") as mock_client:
-                mock_get = mock_client.return_value.__enter__.return_value.get
-                mock_get.return_value = _make_response({"articles": articles})
-                result = _run("transformers")
+            client_patcher, mock_client_cls = _patch_client(_make_response({"articles": articles}))
+            try:
+                result = await _run("transformers")
+            finally:
+                client_patcher.stop()
         finally:
             patcher.stop()
 
-        assert mock_get.call_args.args[0] == "https://api.serply.io/v1/scholar/"
+        assert _get_call(mock_client_cls).args[0] == "https://api.serply.io/v1/scholar/"
         assert result["results"][0]["authors"] == ["A Vaswani", "N Shazeer"]
         assert result["results"][0]["cited_by"] == 120000
         assert result["results"][0]["pdf_url"] == "https://arxiv.org/pdf/1706.03762"
         assert result["results"][1] == {"title": "No metadata", "url": "https://example.org/paper", "content": "", "authors": [], "cited_by": 0, "pdf_url": ""}
 
-    def test_empty_results_returns_error_json(self, mock_config_with_key):
-        with patch("deerflow.community.serply.tools.httpx.Client") as mock_client:
-            mock_client.return_value.__enter__.return_value.get.return_value = _make_response({"results": []})
-            assert _run("nothing") == {"error": "No results found", "query": "nothing"}
+    async def test_empty_results_returns_error_json(self, mock_config_with_key):
+        patcher, _ = _patch_client(_make_response({"results": []}))
+        try:
+            assert await _run("nothing") == {"error": "No results found", "query": "nothing"}
+        finally:
+            patcher.stop()
 
-    def test_missing_results_key_is_treated_as_no_results(self, mock_config_with_key):
-        with patch("deerflow.community.serply.tools.httpx.Client") as mock_client:
-            mock_client.return_value.__enter__.return_value.get.return_value = _make_response({"results": None})
-            assert _run("nothing")["error"] == "No results found"
+    async def test_missing_results_key_is_treated_as_no_results(self, mock_config_with_key):
+        patcher, _ = _patch_client(_make_response({"results": None}))
+        try:
+            assert (await _run("nothing"))["error"] == "No results found"
+        finally:
+            patcher.stop()
 
-    def test_unexpected_payload_shape_returns_error_json(self, mock_config_with_key):
-        with patch("deerflow.community.serply.tools.httpx.Client") as mock_client:
-            mock_client.return_value.__enter__.return_value.get.return_value = _make_response({"results": "not-a-list"})
-            assert "unexpected response format" in _run("q")["error"]
+    async def test_unexpected_payload_shape_returns_error_json(self, mock_config_with_key):
+        patcher, _ = _patch_client(_make_response({"results": "not-a-list"}))
+        try:
+            assert "unexpected response format" in (await _run("q"))["error"]
+        finally:
+            patcher.stop()
 
-        with patch("deerflow.community.serply.tools.httpx.Client") as mock_client:
-            mock_client.return_value.__enter__.return_value.get.return_value = _make_response(["not", "a", "dict"])
-            assert "unexpected response format" in _run("q")["error"]
+        patcher, _ = _patch_client(_make_response(["not", "a", "dict"]))
+        try:
+            assert "unexpected response format" in (await _run("q"))["error"]
+        finally:
+            patcher.stop()
 
     @pytest.mark.parametrize("rows", [["junk", "more junk"], [None, None], [1, 2], [[]], [False]])
-    def test_rows_without_any_objects_return_format_error(self, mock_config_with_key, rows, caplog):
+    async def test_rows_without_any_objects_return_format_error(self, mock_config_with_key, rows, caplog):
         """A non-empty rows container holding no objects is malformed, not an empty search.
 
         Reporting "No results found" for it would tell the agent the query
         legitimately matched nothing, hiding a broken upstream payload.
         """
-        with patch("deerflow.community.serply.tools.httpx.Client") as mock_client:
-            mock_client.return_value.__enter__.return_value.get.return_value = _make_response({"results": rows})
-
+        patcher, _ = _patch_client(_make_response({"results": rows}))
+        try:
             with caplog.at_level(logging.ERROR):
-                result = _run("q")
+                result = await _run("q")
+        finally:
+            patcher.stop()
 
         assert "unexpected response format" in result["error"]
         assert any("no usable result objects" in r.getMessage() for r in caplog.records if r.levelno == logging.ERROR)
 
-    def test_mixed_rows_keep_the_object_entries(self, mock_config_with_key):
+    async def test_mixed_rows_keep_the_object_entries(self, mock_config_with_key):
         rows = ["junk", {"title": "Kept", "link": "https://example.com/kept", "description": "Body"}, 7]
 
-        with patch("deerflow.community.serply.tools.httpx.Client") as mock_client:
-            mock_client.return_value.__enter__.return_value.get.return_value = _make_response({"results": rows})
-            result = _run("q")
+        patcher, _ = _patch_client(_make_response({"results": rows}))
+        try:
+            result = await _run("q")
+        finally:
+            patcher.stop()
 
         assert result["total_results"] == 1
         assert result["results"][0] == {"title": "Kept", "url": "https://example.com/kept", "content": "Body"}
@@ -296,13 +328,15 @@ class TestWebSearchTool:
         ("vertical", "rows_key"),
         [("news", "entries"), ("scholar", "articles")],
     )
-    def test_vertical_rows_without_any_objects_return_format_error(self, vertical, rows_key):
+    async def test_vertical_rows_without_any_objects_return_format_error(self, vertical, rows_key):
         """The news and scholar verticals share the helper, so they contain malformed rows too."""
         patcher, _ = _patch_config({"api_key": "test-serply-key", "max_results": 5, "vertical": vertical})
         try:
-            with patch("deerflow.community.serply.tools.httpx.Client") as mock_client:
-                mock_client.return_value.__enter__.return_value.get.return_value = _make_response({rows_key: ["junk", 3]})
-                result = _run("q")
+            client_patcher, _ = _patch_client(_make_response({rows_key: ["junk", 3]}))
+            try:
+                result = await _run("q")
+            finally:
+                client_patcher.stop()
         finally:
             patcher.stop()
 
@@ -312,24 +346,28 @@ class TestWebSearchTool:
         ("vertical", "rows_key"),
         [("news", "entries"), ("scholar", "articles")],
     )
-    def test_vertical_missing_and_empty_rows_keep_no_results(self, vertical, rows_key):
+    async def test_vertical_missing_and_empty_rows_keep_no_results(self, vertical, rows_key):
         """A missing or empty vertical container stays a legitimate empty search."""
         patcher, _ = _patch_config({"api_key": "test-serply-key", "max_results": 5, "vertical": vertical})
         try:
-            with patch("deerflow.community.serply.tools.httpx.Client") as mock_client:
-                mock_client.return_value.__enter__.return_value.get.return_value = _make_response({rows_key: []})
-                assert _run("nothing")["error"] == "No results found"
+            client_patcher, _ = _patch_client(_make_response({rows_key: []}))
+            try:
+                assert (await _run("nothing"))["error"] == "No results found"
+            finally:
+                client_patcher.stop()
 
-            with patch("deerflow.community.serply.tools.httpx.Client") as mock_client:
-                mock_client.return_value.__enter__.return_value.get.return_value = _make_response({})
-                assert _run("nothing")["error"] == "No results found"
+            client_patcher, _ = _patch_client(_make_response({}))
+            try:
+                assert (await _run("nothing"))["error"] == "No results found"
+            finally:
+                client_patcher.stop()
         finally:
             patcher.stop()
 
-    def test_missing_api_key_returns_error_json_and_warns_once(self, mock_config_no_key, caplog):
+    async def test_missing_api_key_returns_error_json_and_warns_once(self, mock_config_no_key, caplog):
         with patch.dict("os.environ", {}, clear=True), caplog.at_level(logging.WARNING):
-            first = _run("q")
-            second = _run("q")
+            first = await _run("q")
+            second = await _run("q")
 
         assert first == {"error": "SERPLY_API_KEY is not configured", "query": "q"}
         assert second == first
@@ -337,45 +375,52 @@ class TestWebSearchTool:
         assert len(warnings) == 1
         assert "SERPLY_API_KEY" in warnings[0].getMessage()
 
-    def test_http_error_returns_structured_error(self, mock_config_with_key):
+    async def test_http_error_returns_structured_error(self, mock_config_with_key):
         mock_resp = MagicMock()
         mock_resp.status_code = 403
         mock_resp.text = "Forbidden"
         mock_resp.raise_for_status.side_effect = httpx.HTTPStatusError("403", request=MagicMock(), response=mock_resp)
-        with patch("deerflow.community.serply.tools.httpx.Client") as mock_client:
-            mock_client.return_value.__enter__.return_value.get.return_value = mock_resp
-            result = _run("q")
+        patcher, _ = _patch_client(mock_resp)
+        try:
+            result = await _run("q")
+        finally:
+            patcher.stop()
 
         assert result == {"error": "Serply API error: HTTP 403", "query": "q"}
 
-    def test_network_exception_returns_error_json(self, mock_config_with_key):
-        with patch("deerflow.community.serply.tools.httpx.Client") as mock_client:
-            mock_client.return_value.__enter__.return_value.get.side_effect = httpx.ConnectError("boom")
-            result = _run("q")
+    async def test_network_exception_returns_error_json(self, mock_config_with_key):
+        patcher, mock_client_cls = _patch_client(MagicMock())
+        mock_client_cls.return_value.__aenter__.return_value.get.side_effect = httpx.ConnectError("boom")
+        try:
+            result = await _run("q")
+        finally:
+            patcher.stop()
 
         assert result == {"error": "boom", "query": "q"}
 
-    def test_long_query_is_truncated(self, mock_config_with_key):
-        with patch("deerflow.community.serply.tools.httpx.Client") as mock_client:
-            mock_get = mock_client.return_value.__enter__.return_value.get
-            mock_get.return_value = _make_response({"results": _search_rows(1)})
-            _run("x" * 600)
+    async def test_long_query_is_truncated(self, mock_config_with_key):
+        patcher, mock_client_cls = _patch_client(_make_response({"results": _search_rows(1)}))
+        try:
+            await _run("x" * 600)
+        finally:
+            patcher.stop()
 
-        assert len(mock_get.call_args.kwargs["params"]["q"]) == 500
+        assert len(_get_call(mock_client_cls).kwargs["params"]["q"]) == 500
 
-    def test_uses_env_key_when_config_absent(self):
+    async def test_uses_env_key_when_config_absent(self):
         patcher, _ = _patch_config(None)
         try:
             with patch.dict("os.environ", {"SERPLY_API_KEY": "env-key"}):
-                with patch("deerflow.community.serply.tools.httpx.Client") as mock_client:
-                    mock_get = mock_client.return_value.__enter__.return_value.get
-                    mock_get.return_value = _make_response({"results": _search_rows(1)})
-                    result = _run("q")
+                client_patcher, mock_client_cls = _patch_client(_make_response({"results": _search_rows(1)}))
+                try:
+                    result = await _run("q")
+                finally:
+                    client_patcher.stop()
         finally:
             patcher.stop()
 
         assert result["total_results"] == 1
-        assert mock_get.call_args.kwargs["headers"]["X-Api-Key"] == "env-key"
+        assert _get_call(mock_client_cls).kwargs["headers"]["X-Api-Key"] == "env-key"
 
 
 def test_coerce_max_results_inf_falls_back_to_default():
