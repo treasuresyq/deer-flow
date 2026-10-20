@@ -6,8 +6,18 @@ web SERP plus the Google News and Google Scholar verticals, so a research run
 can be pointed at recent coverage or at papers by switching ``vertical`` in
 config.yaml. An API key is required. Sign up at https://serply.io and see
 https://serply.io/docs for the endpoint reference.
+
+The tool is a coroutine and sends its request through ``httpx.AsyncClient``. A
+sync client would run the whole tool on the default executor and hold one of
+that pool's threads for the network round-trip, so several providers queried in
+parallel queued behind each other. The tool config is resolved with
+``asyncio.to_thread``, because resolving it stats the config file and the
+coroutine body now runs on the event loop.
+``backend/tests/blocking_io/test_serply_search_async.py`` pins the result — the
+request is awaited on the loop thread, and the config read does not run there.
 """
 
+import asyncio
 import html
 import json
 import logging
@@ -39,15 +49,28 @@ _api_key_warned: set[str] = set()
 
 
 def _get_api_key(tool_name: str = "web_search") -> str | None:
+    api_key, _ = _resolve_tool_settings(tool_name)
+    return api_key
+
+
+def _resolve_tool_settings(tool_name: str) -> tuple[str | None, dict]:
+    """Resolve the API key and the tool's config extras in one config read.
+
+    Config resolution stats the config file, so callers must run this off the
+    agent event loop. Reading the key and the extras from a single resolution
+    keeps the tool from touching the config file twice per call.
+    """
     config = get_app_config().get_tool_config(tool_name)
-    if config is not None:
-        api_key = (config.model_extra or {}).get("api_key")
-        if isinstance(api_key, str) and api_key.strip():
-            return api_key.strip()
-    env_key = os.getenv("SERPLY_API_KEY")
-    if isinstance(env_key, str) and env_key.strip():
-        return env_key.strip()
-    return None
+    extra = (config.model_extra or {}) if config is not None else {}
+    api_key = None
+    candidate = extra.get("api_key")
+    if isinstance(candidate, str) and candidate.strip():
+        api_key = candidate.strip()
+    if api_key is None:
+        env_key = os.getenv("SERPLY_API_KEY")
+        if isinstance(env_key, str) and env_key.strip():
+            api_key = env_key.strip()
+    return api_key, extra
 
 
 def _coerce_max_results(
@@ -128,7 +151,7 @@ def _response_rows(data: dict, rows_key: str, query: str) -> tuple[list[dict], s
     return usable, None
 
 
-def _serply_get(path: str, api_key: str, query: str, params: dict[str, object]) -> tuple[dict | None, str | None]:
+async def _serply_get(path: str, api_key: str, query: str, params: dict[str, object]) -> tuple[dict | None, str | None]:
     """Send a GET request to a Serply endpoint.
 
     Returns a ``(data, error_json)`` tuple: on success ``data`` is the parsed
@@ -141,8 +164,8 @@ def _serply_get(path: str, api_key: str, query: str, params: dict[str, object]) 
         "User-Agent": "deerflow",
     }
     try:
-        with httpx.Client(timeout=30) as client:
-            response = client.get(f"{_SERPLY_BASE_URL}/{path}/", headers=headers, params=params)
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(f"{_SERPLY_BASE_URL}/{path}/", headers=headers, params=params)
         response.raise_for_status()
         data = response.json()
         if not isinstance(data, dict):
@@ -185,22 +208,22 @@ def _normalize_row(vertical: str, row: dict) -> dict:
 
 
 @tool("web_search", parse_docstring=True)
-def web_search_tool(query: str, max_results: int = 5) -> str:
+async def web_search_tool(query: str, max_results: int = 5) -> str:
     """Search the web for information using Google Search via Serply.
 
     Args:
         query: Search keywords describing what you want to find. Be specific for better results.
         max_results: Maximum number of search results to return. Default is 5, capped at 100.
     """
-    config = get_app_config().get_tool_config("web_search")
-    extra = (config.model_extra or {}) if config is not None else {}
+    # Config resolution can read files; keep it off the event loop. The key and
+    # the extras come from one resolution so the config file is read once.
+    api_key, extra = await asyncio.to_thread(_resolve_tool_settings, "web_search")
     if "max_results" in extra:
         max_results = extra["max_results"]
     max_results = _coerce_max_results(max_results)
     vertical = _coerce_vertical(extra.get("vertical"))
     query = _clean_query(query)
 
-    api_key = _get_api_key("web_search")
     if not api_key:
         return _missing_key_error(query, "web_search")
 
@@ -210,7 +233,7 @@ def web_search_tool(query: str, max_results: int = 5) -> str:
         if key in extra:
             params[key] = extra[key]
 
-    data, error_json = _serply_get(path, api_key, query, params)
+    data, error_json = await _serply_get(path, api_key, query, params)
     if error_json is not None:
         return error_json
 
