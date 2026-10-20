@@ -4,8 +4,18 @@ Web search and fetch tools powered by Sofya.
 Sofya is a hosted web API for agents. Search returns the content of the result
 pages, not only their snippets, and fetch returns a single page as clean
 markdown. An API key is required. Sign up at https://sofya.co to get one.
+
+The tools are coroutines and send their requests through ``httpx.AsyncClient``.
+A sync client would run the whole tool on the default executor and hold one of
+that pool's threads for the network round-trip, so several providers queried in
+parallel queued behind each other. The tool config is resolved with
+``asyncio.to_thread``, because resolving it stats the config file and the
+coroutine body now runs on the event loop.
+``backend/tests/blocking_io/test_sofya_search_async.py`` pins the result — the
+request is awaited on the loop thread, and the config read does not run there.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -31,15 +41,28 @@ _api_key_warned: set[str] = set()
 
 
 def _get_api_key(tool_name: str) -> str | None:
+    api_key, _ = _resolve_tool_settings(tool_name)
+    return api_key
+
+
+def _resolve_tool_settings(tool_name: str) -> tuple[str | None, dict]:
+    """Resolve the API key and the tool's config extras in one config read.
+
+    Config resolution stats the config file, so callers must run this off the
+    agent event loop. Reading the key and the extras from a single resolution
+    keeps the tool from touching the config file twice per call.
+    """
     config = get_app_config().get_tool_config(tool_name)
-    if config is not None:
-        api_key = config.model_extra.get("api_key")
-        if isinstance(api_key, str) and api_key.strip():
-            return api_key.strip()
-    env_key = os.getenv("SOFYA_API_KEY")
-    if isinstance(env_key, str) and env_key.strip():
-        return env_key.strip()
-    return None
+    extra = (config.model_extra or {}) if config is not None else {}
+    api_key = None
+    candidate = extra.get("api_key")
+    if isinstance(candidate, str) and candidate.strip():
+        api_key = candidate.strip()
+    if api_key is None:
+        env_key = os.getenv("SOFYA_API_KEY")
+        if isinstance(env_key, str) and env_key.strip():
+            api_key = env_key.strip()
+    return api_key, extra
 
 
 def _coerce_max_results(value: object, default: int = 5, max_allowed: int = _SOFYA_MAX_RESULTS) -> int:
@@ -80,7 +103,7 @@ def _missing_key_message(tool_name: str) -> str:
     return "SOFYA_API_KEY is not configured"
 
 
-def _sofya_post(path: str, api_key: str, payload: dict) -> tuple[dict | None, str | None]:
+async def _sofya_post(path: str, api_key: str, payload: dict) -> tuple[dict | None, str | None]:
     """Send a POST request to a Sofya endpoint.
 
     Returns a ``(data, error)`` tuple: on success ``data`` is the parsed JSON
@@ -93,8 +116,8 @@ def _sofya_post(path: str, api_key: str, payload: dict) -> tuple[dict | None, st
     }
 
     try:
-        with httpx.Client(timeout=_SOFYA_TIMEOUT) as client:
-            response = client.post(f"{_SOFYA_BASE_URL}{path}", headers=headers, json=payload)
+        async with httpx.AsyncClient(timeout=_SOFYA_TIMEOUT) as client:
+            response = await client.post(f"{_SOFYA_BASE_URL}{path}", headers=headers, json=payload)
         response.raise_for_status()
         data = response.json()
     except httpx.HTTPStatusError as e:
@@ -138,7 +161,7 @@ def _response_results(data: dict) -> list[dict] | None:
 
 
 @tool("web_search", parse_docstring=True)
-def web_search_tool(query: str, max_results: int | None = None, time_range: SearchTimeRange | None = None) -> str:
+async def web_search_tool(query: str, max_results: int | None = None, time_range: SearchTimeRange | None = None) -> str:
     """Search the web for information. Use this tool to find current information, news, articles, and facts from the internet.
 
     Args:
@@ -146,8 +169,9 @@ def web_search_tool(query: str, max_results: int | None = None, time_range: Sear
         max_results: Maximum number of results to return. If omitted, uses the configured value (default 5). Capped at 20.
         time_range: Optional relative publication/update window. Use only when the request requires recent results.
     """
-    config = get_app_config().get_tool_config("web_search")
-    config_extra = (config.model_extra or {}) if config is not None else {}
+    # Config resolution can read files; keep it off the event loop. The key and
+    # the extras come from one resolution so the config file is read once.
+    api_key, config_extra = await asyncio.to_thread(_resolve_tool_settings, "web_search")
     # Honor the caller-supplied max_results; fall back to config only when omitted.
     if max_results is None:
         max_results = config_extra.get("max_results")
@@ -155,7 +179,6 @@ def web_search_tool(query: str, max_results: int | None = None, time_range: Sear
     search_depth = _resolve_search_depth(config_extra.get("search_depth"))
     content_limit = _coerce_content_limit(config_extra.get("contents_max_characters"))
 
-    api_key = _get_api_key("web_search")
     if not api_key:
         return json.dumps({"error": _missing_key_message("web_search"), "query": query}, ensure_ascii=False)
 
@@ -167,7 +190,7 @@ def web_search_tool(query: str, max_results: int | None = None, time_range: Sear
     if time_range is not None:
         payload["freshness"] = time_range
 
-    data, error = _sofya_post(_SOFYA_SEARCH_PATH, api_key, payload)
+    data, error = await _sofya_post(_SOFYA_SEARCH_PATH, api_key, payload)
     if error is not None:
         return json.dumps({"error": error, "query": query}, ensure_ascii=False)
 
@@ -197,7 +220,7 @@ def web_search_tool(query: str, max_results: int | None = None, time_range: Sear
 
 
 @tool("web_fetch", parse_docstring=True)
-def web_fetch_tool(url: str) -> str:
+async def web_fetch_tool(url: str) -> str:
     """Fetch the contents of a web page at a given URL.
     Only fetch EXACT URLs that have been provided directly by the user or have been returned in results from the web_search and web_fetch tools.
     This tool can NOT access content that requires authentication, such as private Google Docs or pages behind login walls.
@@ -207,11 +230,12 @@ def web_fetch_tool(url: str) -> str:
     Args:
         url: The URL to fetch the contents of.
     """
-    api_key = _get_api_key("web_fetch")
+    # Config resolution can read files; keep it off the event loop.
+    api_key, _ = await asyncio.to_thread(_resolve_tool_settings, "web_fetch")
     if not api_key:
         return f"Error: {_missing_key_message('web_fetch')}"
 
-    data, error = _sofya_post(_SOFYA_FETCH_PATH, api_key, {"urls": [url]})
+    data, error = await _sofya_post(_SOFYA_FETCH_PATH, api_key, {"urls": [url]})
     if error is not None:
         return f"Error: {error}"
 

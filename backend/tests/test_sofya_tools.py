@@ -2,10 +2,12 @@
 
 import json
 import logging
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+
+pytestmark = pytest.mark.anyio
 
 
 @pytest.fixture(autouse=True)
@@ -49,6 +51,18 @@ def _make_search_response(results: list) -> MagicMock:
 
 def _make_fetch_response(results: list) -> MagicMock:
     return _make_response({"results": results})
+
+
+def _patch_client(mock_resp: MagicMock):
+    """Patch httpx.AsyncClient so the context-managed ``post`` returns ``mock_resp``."""
+    patcher = patch("deerflow.community.sofya.tools.httpx.AsyncClient")
+    mock_client_cls = patcher.start()
+    mock_client_cls.return_value.__aenter__.return_value.post = AsyncMock(return_value=mock_resp)
+    return patcher, mock_client_cls
+
+
+def _post_call(mock_client_cls):
+    return mock_client_cls.return_value.__aenter__.return_value.post.call_args
 
 
 class TestGetApiKey:
@@ -108,6 +122,33 @@ class TestGetApiKey:
             mock.return_value.get_tool_config.assert_called_with("web_fetch")
 
 
+class TestResolveToolSettings:
+    def test_returns_the_key_and_the_extras_from_one_config_read(self):
+        with patch("deerflow.community.sofya.tools.get_app_config") as mock:
+            tool_config = MagicMock()
+            tool_config.model_extra = {"api_key": "from-config", "search_depth": "snippets"}
+            mock.return_value.get_tool_config.return_value = tool_config
+
+            from deerflow.community.sofya.tools import _resolve_tool_settings
+
+            api_key, extra = _resolve_tool_settings("web_search")
+
+            assert api_key == "from-config"
+            assert extra["search_depth"] == "snippets"
+            mock.return_value.get_tool_config.assert_called_once_with("web_search")
+
+    def test_returns_an_empty_extra_for_an_unconfigured_tool(self):
+        with patch("deerflow.community.sofya.tools.get_app_config") as mock:
+            mock.return_value.get_tool_config.return_value = None
+
+            from deerflow.community.sofya.tools import _resolve_tool_settings
+
+            api_key, extra = _resolve_tool_settings("web_search")
+
+            assert api_key is None
+            assert extra == {}
+
+
 class TestCoerceMaxResults:
     def test_returns_value_when_valid_positive_int(self):
         from deerflow.community.sofya.tools import _coerce_max_results
@@ -165,127 +206,133 @@ class TestMissingKeyMessage:
 
 
 class TestWebSearchTool:
-    def test_basic_search_returns_normalized_results(self, mock_config_with_key):
+    async def test_basic_search_returns_normalized_results(self, mock_config_with_key):
         results = [
             {"title": "Result 1", "url": "https://example.com/1", "content": "Page content 1", "description": "Snippet 1"},
             {"title": "Result 2", "url": "https://example.com/2", "content": "Page content 2", "description": "Snippet 2"},
         ]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_post = mock_client_cls.return_value.__enter__.return_value.post
-            mock_post.return_value = _make_search_response(results)
-
+        patcher, mock_client_cls = _patch_client(_make_search_response(results))
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
-            parsed = json.loads(web_search_tool.invoke({"query": "python tutorial"}))
+            parsed = json.loads(await web_search_tool.ainvoke({"query": "python tutorial"}))
+        finally:
+            patcher.stop()
 
         assert parsed["query"] == "python tutorial"
         assert parsed["total_results"] == 2
         assert parsed["results"][0] == {"title": "Result 1", "url": "https://example.com/1", "content": "Page content 1"}
-        assert mock_post.call_args.kwargs["headers"]["Authorization"] == "Bearer test-sofya-key"
-        assert mock_post.call_args.kwargs["json"]["query"] == "python tutorial"
-        assert mock_post.call_args.kwargs["json"]["search_depth"] == "basic"
-        assert "freshness" not in mock_post.call_args.kwargs["json"]
+        call = _post_call(mock_client_cls)
+        assert call.kwargs["headers"]["Authorization"] == "Bearer test-sofya-key"
+        assert call.kwargs["json"]["query"] == "python tutorial"
+        assert call.kwargs["json"]["search_depth"] == "basic"
+        assert "freshness" not in call.kwargs["json"]
 
-    def test_falls_back_to_description_when_content_is_empty(self, mock_config_with_key):
+    async def test_falls_back_to_description_when_content_is_empty(self, mock_config_with_key):
         results = [{"title": "Result", "url": "https://example.com", "content": "", "description": "Snippet"}]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_search_response(results)
-
+        patcher, _ = _patch_client(_make_search_response(results))
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
-            parsed = json.loads(web_search_tool.invoke({"query": "test"}))
+            parsed = json.loads(await web_search_tool.ainvoke({"query": "test"}))
+        finally:
+            patcher.stop()
 
         assert parsed["results"][0]["content"] == "Snippet"
 
-    def test_time_range_is_sent_as_freshness(self, mock_config_with_key):
+    async def test_time_range_is_sent_as_freshness(self, mock_config_with_key):
         results = [{"title": "Result", "url": "https://example.com", "content": "Body"}]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_post = mock_client_cls.return_value.__enter__.return_value.post
-            mock_post.return_value = _make_search_response(results)
-
+        patcher, mock_client_cls = _patch_client(_make_search_response(results))
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
-            web_search_tool.invoke({"query": "test", "time_range": "week"})
+            await web_search_tool.ainvoke({"query": "test", "time_range": "week"})
+        finally:
+            patcher.stop()
 
-        assert mock_post.call_args.kwargs["json"]["freshness"] == "week"
+        assert _post_call(mock_client_cls).kwargs["json"]["freshness"] == "week"
 
-    def test_search_depth_can_be_set_from_config(self, mock_config_with_key):
+    async def test_search_depth_can_be_set_from_config(self, mock_config_with_key):
         mock_config_with_key.return_value.get_tool_config.return_value.model_extra = {
             "api_key": "test-key",
             "search_depth": "snippets",
         }
         results = [{"title": "Result", "url": "https://example.com", "description": "Snippet"}]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_post = mock_client_cls.return_value.__enter__.return_value.post
-            mock_post.return_value = _make_search_response(results)
-
+        patcher, mock_client_cls = _patch_client(_make_search_response(results))
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
-            web_search_tool.invoke({"query": "test"})
+            await web_search_tool.ainvoke({"query": "test"})
+        finally:
+            patcher.stop()
 
-        assert mock_post.call_args.kwargs["json"]["search_depth"] == "snippets"
+        assert _post_call(mock_client_cls).kwargs["json"]["search_depth"] == "snippets"
 
-    def test_non_string_content_does_not_raise(self, mock_config_with_key):
+    async def test_non_string_content_does_not_raise(self, mock_config_with_key):
         results = [
             {"title": "Numeric", "url": "https://example.com/1", "content": 12345},
             {"title": "Listy", "url": "https://example.com/2", "content": None, "description": ["a", "b"]},
         ]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_search_response(results)
-
+        patcher, _ = _patch_client(_make_search_response(results))
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
-            parsed = json.loads(web_search_tool.invoke({"query": "test"}))
+            parsed = json.loads(await web_search_tool.ainvoke({"query": "test"}))
+        finally:
+            patcher.stop()
 
         assert parsed["results"][0]["content"] == "12345"
         assert parsed["results"][1]["content"] == "['a', 'b']"
 
-    def test_result_content_is_capped_by_default(self, mock_config_with_key):
+    async def test_result_content_is_capped_by_default(self, mock_config_with_key):
         results = [{"title": "Result", "url": "https://example.com", "content": "x" * 9000}]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_search_response(results)
-
+        patcher, _ = _patch_client(_make_search_response(results))
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
-            parsed = json.loads(web_search_tool.invoke({"query": "test"}))
+            parsed = json.loads(await web_search_tool.ainvoke({"query": "test"}))
+        finally:
+            patcher.stop()
 
         assert len(parsed["results"][0]["content"]) == 2000
 
-    def test_contents_max_characters_from_config(self, mock_config_with_key):
+    async def test_contents_max_characters_from_config(self, mock_config_with_key):
         mock_config_with_key.return_value.get_tool_config.return_value.model_extra = {
             "api_key": "test-key",
             "contents_max_characters": 100,
         }
         results = [{"title": "Result", "url": "https://example.com", "content": "x" * 9000}]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_search_response(results)
-
+        patcher, _ = _patch_client(_make_search_response(results))
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
-            parsed = json.loads(web_search_tool.invoke({"query": "test"}))
+            parsed = json.loads(await web_search_tool.ainvoke({"query": "test"}))
+        finally:
+            patcher.stop()
 
         assert len(parsed["results"][0]["content"]) == 100
 
-    def test_contents_max_characters_zero_disables_the_cap(self, mock_config_with_key):
+    async def test_contents_max_characters_zero_disables_the_cap(self, mock_config_with_key):
         mock_config_with_key.return_value.get_tool_config.return_value.model_extra = {
             "api_key": "test-key",
             "contents_max_characters": 0,
         }
         results = [{"title": "Result", "url": "https://example.com", "content": "x" * 9000}]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_search_response(results)
-
+        patcher, _ = _patch_client(_make_search_response(results))
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
-            parsed = json.loads(web_search_tool.invoke({"query": "test"}))
+            parsed = json.loads(await web_search_tool.ainvoke({"query": "test"}))
+        finally:
+            patcher.stop()
 
         assert len(parsed["results"][0]["content"]) == 9000
 
@@ -298,316 +345,332 @@ class TestWebSearchTool:
         assert _coerce_content_limit(0) == 0
         assert _coerce_content_limit("150") == 150
 
-    def test_default_search_stays_under_the_externalize_threshold(self, mock_config_with_key):
+    async def test_default_search_stays_under_the_externalize_threshold(self, mock_config_with_key):
         """Five capped results must stay inline rather than being persisted to disk."""
         results = [{"title": f"R{i}", "url": f"https://example.com/{i}", "content": "x" * 20000} for i in range(5)]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_search_response(results)
-
+        patcher, _ = _patch_client(_make_search_response(results))
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
-            output = web_search_tool.invoke({"query": "test"})
+            output = await web_search_tool.ainvoke({"query": "test"})
+        finally:
+            patcher.stop()
 
         assert len(output) < 12000
 
-    def test_caller_max_results_wins_over_config(self, mock_config_with_key):
+    async def test_caller_max_results_wins_over_config(self, mock_config_with_key):
         mock_config_with_key.return_value.get_tool_config.return_value.model_extra = {
             "api_key": "test-key",
             "max_results": 5,
         }
         results = [{"title": f"R{i}", "url": f"https://x.com/{i}", "content": f"C{i}"} for i in range(10)]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_post = mock_client_cls.return_value.__enter__.return_value.post
-            mock_post.return_value = _make_search_response(results)
-
+        patcher, mock_client_cls = _patch_client(_make_search_response(results))
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
-            parsed = json.loads(web_search_tool.invoke({"query": "test", "max_results": 8}))
+            parsed = json.loads(await web_search_tool.ainvoke({"query": "test", "max_results": 8}))
+        finally:
+            patcher.stop()
 
         assert parsed["total_results"] == 8
-        assert mock_post.call_args.kwargs["json"]["max_results"] == 8
+        assert _post_call(mock_client_cls).kwargs["json"]["max_results"] == 8
 
-    def test_unsupported_search_depth_falls_back_with_warning(self, mock_config_with_key, caplog):
+    async def test_unsupported_search_depth_falls_back_with_warning(self, mock_config_with_key, caplog):
         mock_config_with_key.return_value.get_tool_config.return_value.model_extra = {
             "api_key": "test-key",
             "search_depth": "advanced",
         }
         results = [{"title": "Result", "url": "https://example.com", "content": "Body"}]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_post = mock_client_cls.return_value.__enter__.return_value.post
-            mock_post.return_value = _make_search_response(results)
-
+        patcher, mock_client_cls = _patch_client(_make_search_response(results))
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
             with caplog.at_level(logging.WARNING):
-                web_search_tool.invoke({"query": "test"})
+                await web_search_tool.ainvoke({"query": "test"})
+        finally:
+            patcher.stop()
 
-        assert mock_post.call_args.kwargs["json"]["search_depth"] == "basic"
+        assert _post_call(mock_client_cls).kwargs["json"]["search_depth"] == "basic"
         assert any("search_depth" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
 
-    def test_search_depth_is_normalized(self, mock_config_with_key):
+    async def test_search_depth_is_normalized(self, mock_config_with_key):
         mock_config_with_key.return_value.get_tool_config.return_value.model_extra = {
             "api_key": "test-key",
             "search_depth": " Snippets ",
         }
         results = [{"title": "Result", "url": "https://example.com", "description": "Snippet"}]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_post = mock_client_cls.return_value.__enter__.return_value.post
-            mock_post.return_value = _make_search_response(results)
-
+        patcher, mock_client_cls = _patch_client(_make_search_response(results))
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
-            web_search_tool.invoke({"query": "test"})
+            await web_search_tool.ainvoke({"query": "test"})
+        finally:
+            patcher.stop()
 
-        assert mock_post.call_args.kwargs["json"]["search_depth"] == "snippets"
+        assert _post_call(mock_client_cls).kwargs["json"]["search_depth"] == "snippets"
 
-    def test_respects_max_results_from_config(self, mock_config_with_key):
+    async def test_respects_max_results_from_config(self, mock_config_with_key):
         mock_config_with_key.return_value.get_tool_config.return_value.model_extra = {
             "api_key": "test-key",
             "max_results": 3,
         }
         results = [{"title": f"R{i}", "url": f"https://x.com/{i}", "content": f"C{i}"} for i in range(10)]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_post = mock_client_cls.return_value.__enter__.return_value.post
-            mock_post.return_value = _make_search_response(results)
-
+        patcher, _ = _patch_client(_make_search_response(results))
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
-            parsed = json.loads(web_search_tool.invoke({"query": "test"}))
+            parsed = json.loads(await web_search_tool.ainvoke({"query": "test"}))
+        finally:
+            patcher.stop()
 
         assert parsed["total_results"] == 3
-        assert mock_post.call_args.kwargs["json"]["max_results"] == 3
 
-    def test_config_max_results_is_capped(self, mock_config_with_key):
+    async def test_config_max_results_is_capped(self, mock_config_with_key):
         mock_config_with_key.return_value.get_tool_config.return_value.model_extra = {
             "api_key": "test-key",
             "max_results": 999,
         }
         results = [{"title": f"R{i}", "url": f"https://x.com/{i}", "content": f"C{i}"} for i in range(30)]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_post = mock_client_cls.return_value.__enter__.return_value.post
-            mock_post.return_value = _make_search_response(results)
-
+        patcher, mock_client_cls = _patch_client(_make_search_response(results))
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
-            parsed = json.loads(web_search_tool.invoke({"query": "test"}))
+            parsed = json.loads(await web_search_tool.ainvoke({"query": "test"}))
+        finally:
+            patcher.stop()
 
         assert parsed["total_results"] == 20
-        assert mock_post.call_args.kwargs["json"]["max_results"] == 20
+        assert _post_call(mock_client_cls).kwargs["json"]["max_results"] == 20
 
-    def test_max_results_parameter_accepted(self, mock_config_no_key):
+    async def test_max_results_parameter_accepted(self, mock_config_no_key):
         """Tool accepts max_results as a call parameter when config does not override it."""
         results = [{"title": f"R{i}", "url": f"https://x.com/{i}", "content": f"C{i}"} for i in range(10)]
 
         with patch.dict("os.environ", {"SOFYA_API_KEY": "env-key"}):
-            with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-                mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_search_response(results)
-
+            patcher, _ = _patch_client(_make_search_response(results))
+            try:
                 from deerflow.community.sofya.tools import web_search_tool
 
-                parsed = json.loads(web_search_tool.invoke({"query": "test", "max_results": 2}))
+                parsed = json.loads(await web_search_tool.ainvoke({"query": "test", "max_results": 2}))
+            finally:
+                patcher.stop()
 
         assert parsed["total_results"] == 2
 
-    def test_empty_results_return_error_json(self, mock_config_with_key):
+    async def test_empty_results_return_error_json(self, mock_config_with_key):
         """An empty result list returns a structured error, matching ddg_search convention."""
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_search_response([])
-
+        patcher, _ = _patch_client(_make_search_response([]))
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
-            parsed = json.loads(web_search_tool.invoke({"query": "no results"}))
+            parsed = json.loads(await web_search_tool.ainvoke({"query": "no results"}))
+        finally:
+            patcher.stop()
 
         assert parsed["error"] == "No results found"
         assert parsed["query"] == "no results"
 
-    def test_unexpected_results_type_returns_error_json(self, mock_config_with_key):
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_response({"results": "nope"})
-
+    async def test_unexpected_results_type_returns_error_json(self, mock_config_with_key):
+        patcher, _ = _patch_client(_make_response({"results": "nope"}))
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
-            parsed = json.loads(web_search_tool.invoke({"query": "test"}))
+            parsed = json.loads(await web_search_tool.ainvoke({"query": "test"}))
+        finally:
+            patcher.stop()
 
         assert parsed["error"] == "Sofya returned an unexpected response format"
 
     @pytest.mark.parametrize("results", [["a", "b"], [None, None], [1, 2], [[]], [False]])
-    def test_results_without_any_objects_returns_format_error(self, mock_config_with_key, results, caplog):
+    async def test_results_without_any_objects_returns_format_error(self, mock_config_with_key, results, caplog):
         """A non-empty `results` holding no objects is malformed, not an empty search."""
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_search_response(results)
-
+        patcher, _ = _patch_client(_make_search_response(results))
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
             with caplog.at_level(logging.ERROR):
-                parsed = json.loads(web_search_tool.invoke({"query": "test"}))
+                parsed = json.loads(await web_search_tool.ainvoke({"query": "test"}))
+        finally:
+            patcher.stop()
 
         assert parsed["error"] == "Sofya returned an unexpected response format"
         assert any("no usable result objects" in r.getMessage() for r in caplog.records if r.levelno == logging.ERROR)
 
-    def test_mixed_results_keep_the_object_entries(self, mock_config_with_key):
+    async def test_mixed_results_keep_the_object_entries(self, mock_config_with_key):
         results = ["junk", {"title": "Kept", "url": "https://example.com/1", "content": "Body"}, 7]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_search_response(results)
-
+        patcher, _ = _patch_client(_make_search_response(results))
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
-            parsed = json.loads(web_search_tool.invoke({"query": "test"}))
+            parsed = json.loads(await web_search_tool.ainvoke({"query": "test"}))
+        finally:
+            patcher.stop()
 
         assert parsed["total_results"] == 1
         assert parsed["results"][0] == {"title": "Kept", "url": "https://example.com/1", "content": "Body"}
 
-    def test_http_error_returns_error_json(self, mock_config_with_key):
+    async def test_http_error_returns_error_json(self, mock_config_with_key):
         request = httpx.Request("POST", "https://sofya.co/v1/search")
         response = httpx.Response(402, text="Insufficient credits", request=request)
         mock_resp = MagicMock()
         mock_resp.raise_for_status.side_effect = httpx.HTTPStatusError("error", request=request, response=response)
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = mock_resp
-
+        patcher, _ = _patch_client(mock_resp)
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
-            parsed = json.loads(web_search_tool.invoke({"query": "test"}))
+            parsed = json.loads(await web_search_tool.ainvoke({"query": "test"}))
+        finally:
+            patcher.stop()
 
         assert parsed["error"] == "Sofya API error: HTTP 402"
 
-    def test_network_error_returns_error_json(self, mock_config_with_key):
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.side_effect = httpx.ConnectError("boom")
-
+    async def test_network_error_returns_error_json(self, mock_config_with_key):
+        patcher, mock_client_cls = _patch_client(MagicMock())
+        mock_client_cls.return_value.__aenter__.return_value.post.side_effect = httpx.ConnectError("boom")
+        try:
             from deerflow.community.sofya.tools import web_search_tool
 
-            parsed = json.loads(web_search_tool.invoke({"query": "test"}))
+            parsed = json.loads(await web_search_tool.ainvoke({"query": "test"}))
+        finally:
+            patcher.stop()
 
         assert parsed["error"] == "boom"
 
-    def test_missing_key_returns_error_json(self, mock_config_no_key):
+    async def test_missing_key_returns_error_json(self, mock_config_no_key):
         with patch.dict("os.environ", {}, clear=True):
             from deerflow.community.sofya.tools import web_search_tool
 
-            parsed = json.loads(web_search_tool.invoke({"query": "test"}))
+            parsed = json.loads(await web_search_tool.ainvoke({"query": "test"}))
 
         assert parsed["error"] == "SOFYA_API_KEY is not configured"
         assert parsed["query"] == "test"
 
 
 class TestWebFetchTool:
-    def test_returns_title_and_content(self, mock_config_with_key):
+    async def test_returns_title_and_content(self, mock_config_with_key):
         results = [{"title": "Example Page", "url": "https://example.com", "content": "# Markdown body", "success": True}]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_post = mock_client_cls.return_value.__enter__.return_value.post
-            mock_post.return_value = _make_fetch_response(results)
-
+        patcher, mock_client_cls = _patch_client(_make_fetch_response(results))
+        try:
             from deerflow.community.sofya.tools import web_fetch_tool
 
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+            result = await web_fetch_tool.ainvoke({"url": "https://example.com"})
+        finally:
+            patcher.stop()
 
         assert result == "# Example Page\n\n# Markdown body"
-        assert mock_post.call_args.kwargs["json"] == {"urls": ["https://example.com"]}
+        assert _post_call(mock_client_cls).kwargs["json"] == {"urls": ["https://example.com"]}
 
-    def test_truncates_long_content(self, mock_config_with_key):
+    async def test_truncates_long_content(self, mock_config_with_key):
         results = [{"title": "Long", "url": "https://example.com", "content": "x" * 9000, "success": True}]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_fetch_response(results)
-
+        patcher, _ = _patch_client(_make_fetch_response(results))
+        try:
             from deerflow.community.sofya.tools import web_fetch_tool
 
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+            result = await web_fetch_tool.ainvoke({"url": "https://example.com"})
+        finally:
+            patcher.stop()
 
         assert len(result) == len("# Long\n\n") + 4096
 
-    def test_non_string_content_does_not_raise(self, mock_config_with_key):
+    async def test_non_string_content_does_not_raise(self, mock_config_with_key):
         results = [{"title": "Numeric", "url": "https://example.com", "content": 12345, "success": True}]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_fetch_response(results)
-
+        patcher, _ = _patch_client(_make_fetch_response(results))
+        try:
             from deerflow.community.sofya.tools import web_fetch_tool
 
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+            result = await web_fetch_tool.ainvoke({"url": "https://example.com"})
+        finally:
+            patcher.stop()
 
         assert result == "# Numeric\n\n12345"
 
-    def test_missing_content_still_reports_no_content(self, mock_config_with_key):
+    async def test_missing_content_still_reports_no_content(self, mock_config_with_key):
         results = [{"title": "Empty", "url": "https://example.com", "content": None, "success": True}]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_fetch_response(results)
-
+        patcher, _ = _patch_client(_make_fetch_response(results))
+        try:
             from deerflow.community.sofya.tools import web_fetch_tool
 
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+            result = await web_fetch_tool.ainvoke({"url": "https://example.com"})
+        finally:
+            patcher.stop()
 
         assert result == "Error: No content found"
 
-    def test_falls_back_to_untitled(self, mock_config_with_key):
+    async def test_falls_back_to_untitled(self, mock_config_with_key):
         results = [{"title": "", "url": "https://example.com", "content": "Body", "success": True}]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_fetch_response(results)
-
+        patcher, _ = _patch_client(_make_fetch_response(results))
+        try:
             from deerflow.community.sofya.tools import web_fetch_tool
 
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+            result = await web_fetch_tool.ainvoke({"url": "https://example.com"})
+        finally:
+            patcher.stop()
 
         assert result == "# Untitled\n\nBody"
 
-    def test_failed_result_returns_its_error(self, mock_config_with_key):
+    async def test_failed_result_returns_its_error(self, mock_config_with_key):
         results = [{"url": "https://example.com", "success": False, "error": "404 Not Found"}]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_fetch_response(results)
-
+        patcher, _ = _patch_client(_make_fetch_response(results))
+        try:
             from deerflow.community.sofya.tools import web_fetch_tool
 
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+            result = await web_fetch_tool.ainvoke({"url": "https://example.com"})
+        finally:
+            patcher.stop()
 
         assert result == "Error: 404 Not Found"
 
-    def test_empty_content_returns_error(self, mock_config_with_key):
+    async def test_empty_content_returns_error(self, mock_config_with_key):
         results = [{"title": "Empty", "url": "https://example.com", "content": "", "success": True}]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_fetch_response(results)
-
+        patcher, _ = _patch_client(_make_fetch_response(results))
+        try:
             from deerflow.community.sofya.tools import web_fetch_tool
 
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+            result = await web_fetch_tool.ainvoke({"url": "https://example.com"})
+        finally:
+            patcher.stop()
 
         assert result == "Error: No content found"
 
-    def test_no_results_returns_error(self, mock_config_with_key):
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_fetch_response([])
-
+    async def test_no_results_returns_error(self, mock_config_with_key):
+        patcher, _ = _patch_client(_make_fetch_response([]))
+        try:
             from deerflow.community.sofya.tools import web_fetch_tool
 
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+            result = await web_fetch_tool.ainvoke({"url": "https://example.com"})
+        finally:
+            patcher.stop()
 
         assert result == "Error: No results found"
 
-    def test_results_without_any_objects_returns_format_error(self, mock_config_with_key):
+    async def test_results_without_any_objects_returns_format_error(self, mock_config_with_key):
         """A non-empty `results` holding no objects is malformed, not an empty fetch."""
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_fetch_response(["a", 3])
-
+        patcher, _ = _patch_client(_make_fetch_response(["a", 3]))
+        try:
             from deerflow.community.sofya.tools import web_fetch_tool
 
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+            result = await web_fetch_tool.ainvoke({"url": "https://example.com"})
+        finally:
+            patcher.stop()
 
         assert result == "Error: Sofya returned an unexpected response format"
 
-    def test_mixed_results_returns_first_object_content(self, mock_config_with_key):
+    async def test_mixed_results_returns_first_object_content(self, mock_config_with_key):
         results = [
             "junk",
             None,
@@ -617,35 +680,37 @@ class TestWebFetchTool:
             False,
         ]
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_fetch_response(results)
-
+        patcher, _ = _patch_client(_make_fetch_response(results))
+        try:
             from deerflow.community.sofya.tools import web_fetch_tool
 
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+            result = await web_fetch_tool.ainvoke({"url": "https://example.com"})
+        finally:
+            patcher.stop()
 
         assert result == "# First page\n\nFirst body"
 
-    def test_http_error_returns_error_string(self, mock_config_with_key):
+    async def test_http_error_returns_error_string(self, mock_config_with_key):
         request = httpx.Request("POST", "https://sofya.co/v1/fetch")
         response = httpx.Response(401, text="Invalid API key", request=request)
         mock_resp = MagicMock()
         mock_resp.raise_for_status.side_effect = httpx.HTTPStatusError("error", request=request, response=response)
 
-        with patch("deerflow.community.sofya.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = mock_resp
-
+        patcher, _ = _patch_client(mock_resp)
+        try:
             from deerflow.community.sofya.tools import web_fetch_tool
 
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+            result = await web_fetch_tool.ainvoke({"url": "https://example.com"})
+        finally:
+            patcher.stop()
 
         assert result == "Error: Sofya API error: HTTP 401"
 
-    def test_missing_key_returns_error_string(self, mock_config_no_key):
+    async def test_missing_key_returns_error_string(self, mock_config_no_key):
         with patch.dict("os.environ", {}, clear=True):
             from deerflow.community.sofya.tools import web_fetch_tool
 
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+            result = await web_fetch_tool.ainvoke({"url": "https://example.com"})
 
         assert result == "Error: SOFYA_API_KEY is not configured"
 
