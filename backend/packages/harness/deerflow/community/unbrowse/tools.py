@@ -7,8 +7,18 @@ over plain HTTP when that is enough, or through a cloud browser when the page
 needs JavaScript to render. Calls go to Unbrowse's MCP endpoint as a single
 JSON-RPC ``tools/call`` POST. An API key is required. Get one at
 https://unbrowse.ai/app.
+
+The tool is a coroutine and sends its request through ``httpx.AsyncClient``. A
+sync client would run the whole tool on the default executor and hold one of
+that pool's threads for the network round-trip, so several providers queried in
+parallel queued behind each other. The tool config is resolved with
+``asyncio.to_thread``, because resolving it stats the config file and the
+coroutine body now runs on the event loop.
+``backend/tests/blocking_io/test_unbrowse_fetch_async.py`` pins the result — the
+request is awaited on the loop thread, and the config read does not run there.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -30,15 +40,28 @@ _api_key_warned: set[str] = set()
 
 
 def _get_api_key(tool_name: str) -> str | None:
+    api_key, _ = _resolve_tool_settings(tool_name)
+    return api_key
+
+
+def _resolve_tool_settings(tool_name: str) -> tuple[str | None, dict]:
+    """Resolve the API key and the tool's config extras in one config read.
+
+    Config resolution stats the config file, so callers must run this off the
+    agent event loop. Reading the key and the extras from a single resolution
+    keeps the tool from touching the config file twice per call.
+    """
     config = get_app_config().get_tool_config(tool_name)
-    if config is not None:
-        api_key = config.model_extra.get("api_key")
-        if isinstance(api_key, str) and api_key.strip():
-            return api_key.strip()
-    env_key = os.getenv("UNBROWSE_API_KEY")
-    if isinstance(env_key, str) and env_key.strip():
-        return env_key.strip()
-    return None
+    extra = (config.model_extra or {}) if config is not None else {}
+    api_key = None
+    candidate = extra.get("api_key")
+    if isinstance(candidate, str) and candidate.strip():
+        api_key = candidate.strip()
+    if api_key is None:
+        env_key = os.getenv("UNBROWSE_API_KEY")
+        if isinstance(env_key, str) and env_key.strip():
+            api_key = env_key.strip()
+    return api_key, extra
 
 
 def _resolve_render(value: object) -> str:
@@ -67,7 +90,7 @@ def _tool_result_text(result: dict) -> str:
     return "\n".join(block["text"] for block in content if isinstance(block, dict) and isinstance(block.get("text"), str))
 
 
-def _call_unbrowse_tool(name: str, api_key: str, arguments: dict) -> tuple[dict | None, str | None]:
+async def _call_unbrowse_tool(name: str, api_key: str, arguments: dict) -> tuple[dict | None, str | None]:
     """Call an Unbrowse MCP tool with one JSON-RPC ``tools/call`` request.
 
     Returns a ``(data, error)`` tuple: on success ``data`` is the tool's JSON
@@ -87,8 +110,8 @@ def _call_unbrowse_tool(name: str, api_key: str, arguments: dict) -> tuple[dict 
     }
 
     try:
-        with httpx.Client(timeout=_UNBROWSE_TIMEOUT) as client:
-            response = client.post(_UNBROWSE_MCP_URL, headers=headers, json=request)
+        async with httpx.AsyncClient(timeout=_UNBROWSE_TIMEOUT) as client:
+            response = await client.post(_UNBROWSE_MCP_URL, headers=headers, json=request)
         response.raise_for_status()
         data = response.json()
     except httpx.HTTPStatusError as e:
@@ -142,7 +165,7 @@ def _clip(value: object, limit: int) -> str:
 
 
 @tool("web_fetch", parse_docstring=True)
-def web_fetch_tool(url: str) -> str:
+async def web_fetch_tool(url: str) -> str:
     """Fetch the contents of a web page at a given URL.
     Only fetch EXACT URLs that have been provided directly by the user or have been returned in results from the web_search and web_fetch tools.
     This tool can NOT access content that requires authentication, such as private Google Docs or pages behind login walls.
@@ -152,16 +175,16 @@ def web_fetch_tool(url: str) -> str:
     Args:
         url: The URL to fetch the contents of.
     """
-    api_key = _get_api_key("web_fetch")
+    # Config resolution can read files; keep it off the event loop. The key and
+    # the extras come from one resolution so the config file is read once.
+    api_key, config_extra = await asyncio.to_thread(_resolve_tool_settings, "web_fetch")
     if not api_key:
         return f"Error: {_missing_key_message('web_fetch')}"
 
-    config = get_app_config().get_tool_config("web_fetch")
-    config_extra = (config.model_extra or {}) if config is not None else {}
     render = _resolve_render(config_extra.get("render"))
 
     arguments = {"url": url, "formats": ["markdown"], "render": render}
-    data, error = _call_unbrowse_tool(_UNBROWSE_SCRAPE_TOOL, api_key, arguments)
+    data, error = await _call_unbrowse_tool(_UNBROWSE_SCRAPE_TOOL, api_key, arguments)
     if error is not None:
         return f"Error: {error}"
 
