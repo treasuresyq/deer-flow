@@ -76,13 +76,13 @@ async def _run(query: str = "test query", max_results: int = 5) -> dict:
     return json.loads(await web_search_tool.ainvoke({"query": query, "max_results": max_results}))
 
 
-class TestGetApiKey:
+class TestResolveToolSettings:
     def test_returns_config_key_when_present(self):
         patcher, _ = _patch_config({"api_key": "from-config"})
         try:
-            from deerflow.community.serply.tools import _get_api_key
+            from deerflow.community.serply.tools import _resolve_tool_settings
 
-            assert _get_api_key("web_search") == "from-config"
+            assert _resolve_tool_settings("web_search")[0] == "from-config"
         finally:
             patcher.stop()
 
@@ -90,9 +90,9 @@ class TestGetApiKey:
         patcher, _ = _patch_config({"api_key": "   "})
         try:
             with patch.dict("os.environ", {"SERPLY_API_KEY": "env-key"}):
-                from deerflow.community.serply.tools import _get_api_key
+                from deerflow.community.serply.tools import _resolve_tool_settings
 
-                assert _get_api_key("web_search") == "env-key"
+                assert _resolve_tool_settings("web_search")[0] == "env-key"
         finally:
             patcher.stop()
 
@@ -100,9 +100,9 @@ class TestGetApiKey:
         patcher, _ = _patch_config(None)
         try:
             with patch.dict("os.environ", {"SERPLY_API_KEY": "env-only"}):
-                from deerflow.community.serply.tools import _get_api_key
+                from deerflow.community.serply.tools import _resolve_tool_settings
 
-                assert _get_api_key("web_search") == "env-only"
+                assert _resolve_tool_settings("web_search")[0] == "env-only"
         finally:
             patcher.stop()
 
@@ -110,9 +110,9 @@ class TestGetApiKey:
         patcher, _ = _patch_config(None)
         try:
             with patch.dict("os.environ", {}, clear=True):
-                from deerflow.community.serply.tools import _get_api_key
+                from deerflow.community.serply.tools import _resolve_tool_settings
 
-                assert _get_api_key("web_search") is None
+                assert _resolve_tool_settings("web_search")[0] is None
         finally:
             patcher.stop()
 

@@ -14,7 +14,8 @@ parallel queued behind each other. The tool config is resolved with
 ``asyncio.to_thread``, because resolving it stats the config file and the
 coroutine body now runs on the event loop.
 ``backend/tests/blocking_io/test_serply_search_async.py`` pins the result — the
-request is awaited on the loop thread, and the config read does not run there.
+request is awaited on the loop thread, the config read does not run there, and
+the request goes out through the async client.
 """
 
 import asyncio
@@ -46,11 +47,6 @@ _VERTICALS: dict[str, tuple[str, str]] = {
 _PASSTHROUGH_PARAMS = ("gl", "hl")
 _TAG_RE = re.compile(r"<[^>]+>")
 _api_key_warned: set[str] = set()
-
-
-def _get_api_key(tool_name: str = "web_search") -> str | None:
-    api_key, _ = _resolve_tool_settings(tool_name)
-    return api_key
 
 
 def _resolve_tool_settings(tool_name: str) -> tuple[str | None, dict]:
