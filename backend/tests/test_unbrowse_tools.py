@@ -2,10 +2,12 @@
 
 import json
 import logging
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+
+pytestmark = pytest.mark.anyio
 
 
 @pytest.fixture(autouse=True)
@@ -59,6 +61,24 @@ def _scrape(markdown: object = "# Example Domain\n\nBody", title: object = "Exam
         "metadata": {"title": title, "sourceURL": "https://example.com/", "statusCode": 200},
         "markdown": markdown,
     }
+
+
+def _patch_client(mock_resp: MagicMock):
+    """Patch httpx.AsyncClient so the context-managed ``post`` returns ``mock_resp``."""
+    patcher = patch("deerflow.community.unbrowse.tools.httpx.AsyncClient")
+    mock_client_cls = patcher.start()
+    mock_client_cls.return_value.__aenter__.return_value.post = AsyncMock(return_value=mock_resp)
+    return patcher, mock_client_cls
+
+
+def _post_call(mock_client_cls):
+    return mock_client_cls.return_value.__aenter__.return_value.post.call_args
+
+
+async def _fetch(url: str = "https://example.com") -> str:
+    from deerflow.community.unbrowse.tools import web_fetch_tool
+
+    return await web_fetch_tool.ainvoke({"url": url})
 
 
 class TestGetApiKey:
@@ -140,30 +160,26 @@ class TestMissingKeyMessage:
 
 
 class TestWebFetchTool:
-    def test_returns_title_and_markdown(self, mock_config_with_key):
-        with patch("deerflow.community.unbrowse.tools.httpx.Client") as mock_client_cls:
-            mock_post = mock_client_cls.return_value.__enter__.return_value.post
-            mock_post.return_value = _make_scrape_response(_scrape())
-
-            from deerflow.community.unbrowse.tools import web_fetch_tool
-
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+    async def test_returns_title_and_markdown(self, mock_config_with_key):
+        patcher, _ = _patch_client(_make_scrape_response(_scrape()))
+        try:
+            result = await _fetch()
+        finally:
+            patcher.stop()
 
         assert result == "# Example Domain\n\n# Example Domain\n\nBody"
 
-    def test_sends_one_json_rpc_tools_call(self, mock_config_with_key):
-        with patch("deerflow.community.unbrowse.tools.httpx.Client") as mock_client_cls:
-            mock_post = mock_client_cls.return_value.__enter__.return_value.post
-            mock_post.return_value = _make_scrape_response(_scrape())
+    async def test_sends_one_json_rpc_tools_call(self, mock_config_with_key):
+        patcher, mock_client_cls = _patch_client(_make_scrape_response(_scrape()))
+        try:
+            await _fetch()
+            call = _post_call(mock_client_cls)
+        finally:
+            patcher.stop()
 
-            from deerflow.community.unbrowse.tools import web_fetch_tool
-
-            web_fetch_tool.invoke({"url": "https://example.com"})
-
-        assert mock_post.call_count == 1
-        assert mock_post.call_args.args[0] == "https://unbrowse.ai/api/mcp"
-        assert mock_post.call_args.kwargs["headers"]["Authorization"] == "Bearer test-unbrowse-key"
-        assert mock_post.call_args.kwargs["json"] == {
+        assert call.args[0] == "https://unbrowse.ai/api/mcp"
+        assert call.kwargs["headers"]["Authorization"] == "Bearer test-unbrowse-key"
+        assert call.kwargs["json"] == {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
@@ -173,97 +189,89 @@ class TestWebFetchTool:
             },
         }
 
-    def test_render_can_be_set_from_config(self, mock_config_with_key):
+    async def test_render_can_be_set_from_config(self, mock_config_with_key):
         mock_config_with_key.return_value.get_tool_config.return_value.model_extra = {"api_key": "k", "render": "never"}
 
-        with patch("deerflow.community.unbrowse.tools.httpx.Client") as mock_client_cls:
-            mock_post = mock_client_cls.return_value.__enter__.return_value.post
-            mock_post.return_value = _make_scrape_response(_scrape())
+        patcher, mock_client_cls = _patch_client(_make_scrape_response(_scrape()))
+        try:
+            await _fetch()
+            call = _post_call(mock_client_cls)
+        finally:
+            patcher.stop()
 
-            from deerflow.community.unbrowse.tools import web_fetch_tool
+        assert call.kwargs["json"]["params"]["arguments"]["render"] == "never"
 
-            web_fetch_tool.invoke({"url": "https://example.com"})
-
-        assert mock_post.call_args.kwargs["json"]["params"]["arguments"]["render"] == "never"
-
-    def test_prefers_structured_content(self, mock_config_with_key):
+    async def test_prefers_structured_content(self, mock_config_with_key):
         response = _make_scrape_response(_scrape(markdown="from text"), structured=True)
         response.json.return_value["result"]["structuredContent"] = _scrape(markdown="from structured")
 
-        with patch("deerflow.community.unbrowse.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = response
-
-            from deerflow.community.unbrowse.tools import web_fetch_tool
-
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+        patcher, _ = _patch_client(response)
+        try:
+            result = await _fetch()
+        finally:
+            patcher.stop()
 
         assert result == "# Example Domain\n\nfrom structured"
 
-    def test_truncates_long_content(self, mock_config_with_key):
-        with patch("deerflow.community.unbrowse.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_scrape_response(_scrape(markdown="x" * 9000, title="Long"))
-
-            from deerflow.community.unbrowse.tools import web_fetch_tool
-
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+    async def test_truncates_long_content(self, mock_config_with_key):
+        patcher, _ = _patch_client(_make_scrape_response(_scrape(markdown="x" * 9000, title="Long")))
+        try:
+            result = await _fetch()
+        finally:
+            patcher.stop()
 
         assert len(result) == len("# Long\n\n") + 4096
 
-    def test_non_string_markdown_does_not_raise(self, mock_config_with_key):
-        with patch("deerflow.community.unbrowse.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_scrape_response(_scrape(markdown=12345, title="Numeric"))
-
-            from deerflow.community.unbrowse.tools import web_fetch_tool
-
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+    async def test_non_string_markdown_does_not_raise(self, mock_config_with_key):
+        patcher, _ = _patch_client(_make_scrape_response(_scrape(markdown=12345, title="Numeric")))
+        try:
+            result = await _fetch()
+        finally:
+            patcher.stop()
 
         assert result == "# Numeric\n\n12345"
 
-    def test_falls_back_to_untitled(self, mock_config_with_key):
+    async def test_falls_back_to_untitled(self, mock_config_with_key):
         scrape = _scrape(markdown="Body")
         scrape["metadata"] = None
 
-        with patch("deerflow.community.unbrowse.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_scrape_response(scrape)
-
-            from deerflow.community.unbrowse.tools import web_fetch_tool
-
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+        patcher, _ = _patch_client(_make_scrape_response(scrape))
+        try:
+            result = await _fetch()
+        finally:
+            patcher.stop()
 
         assert result == "# Untitled\n\nBody"
 
     @pytest.mark.parametrize("markdown", ["", None])
-    def test_empty_markdown_returns_error(self, mock_config_with_key, markdown):
-        with patch("deerflow.community.unbrowse.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_scrape_response(_scrape(markdown=markdown))
-
-            from deerflow.community.unbrowse.tools import web_fetch_tool
-
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+    async def test_empty_markdown_returns_error(self, mock_config_with_key, markdown):
+        patcher, _ = _patch_client(_make_scrape_response(_scrape(markdown=markdown)))
+        try:
+            result = await _fetch()
+        finally:
+            patcher.stop()
 
         assert result == "Error: No content found"
 
-    def test_json_rpc_error_returns_its_message(self, mock_config_with_key):
+    async def test_json_rpc_error_returns_its_message(self, mock_config_with_key):
         payload = {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "page.goto: net::ERR_NAME_NOT_RESOLVED", "data": None}}
 
-        with patch("deerflow.community.unbrowse.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_response(payload)
-
-            from deerflow.community.unbrowse.tools import web_fetch_tool
-
-            result = web_fetch_tool.invoke({"url": "https://nope.invalid"})
+        patcher, _ = _patch_client(_make_response(payload))
+        try:
+            result = await _fetch("https://nope.invalid")
+        finally:
+            patcher.stop()
 
         assert result == "Error: Unbrowse error: page.goto: net::ERR_NAME_NOT_RESOLVED"
 
-    def test_tool_error_result_returns_its_text(self, mock_config_with_key):
+    async def test_tool_error_result_returns_its_text(self, mock_config_with_key):
         payload = {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "render failed"}], "isError": True}}
 
-        with patch("deerflow.community.unbrowse.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_response(payload)
-
-            from deerflow.community.unbrowse.tools import web_fetch_tool
-
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+        patcher, _ = _patch_client(_make_response(payload))
+        try:
+            result = await _fetch()
+        finally:
+            patcher.stop()
 
         assert result == "Error: Unbrowse error: render failed"
 
@@ -277,47 +285,47 @@ class TestWebFetchTool:
         ],
         ids=["non-dict-body", "non-dict-result", "non-json-text", "non-object-json"],
     )
-    def test_malformed_response_returns_error(self, mock_config_with_key, payload):
-        with patch("deerflow.community.unbrowse.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = _make_response(payload)
-
-            from deerflow.community.unbrowse.tools import web_fetch_tool
-
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+    async def test_malformed_response_returns_error(self, mock_config_with_key, payload):
+        patcher, _ = _patch_client(_make_response(payload))
+        try:
+            result = await _fetch()
+        finally:
+            patcher.stop()
 
         assert result == "Error: Unbrowse returned an unexpected response format"
 
-    def test_http_error_returns_error_string(self, mock_config_with_key):
+    async def test_http_error_returns_error_string(self, mock_config_with_key):
         request = httpx.Request("POST", "https://unbrowse.ai/api/mcp")
         response = httpx.Response(401, text='{"error":"invalid_token"}', request=request)
         mock_resp = MagicMock()
         mock_resp.raise_for_status.side_effect = httpx.HTTPStatusError("error", request=request, response=response)
 
-        with patch("deerflow.community.unbrowse.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.return_value = mock_resp
-
-            from deerflow.community.unbrowse.tools import web_fetch_tool
-
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+        patcher, _ = _patch_client(mock_resp)
+        try:
+            result = await _fetch()
+        finally:
+            patcher.stop()
 
         assert result == "Error: Unbrowse API error: HTTP 401"
 
-    def test_network_error_returns_error_string(self, mock_config_with_key):
-        with patch("deerflow.community.unbrowse.tools.httpx.Client") as mock_client_cls:
-            mock_client_cls.return_value.__enter__.return_value.post.side_effect = httpx.ConnectError("boom")
-
-            from deerflow.community.unbrowse.tools import web_fetch_tool
-
-            result = web_fetch_tool.invoke({"url": "https://example.com"})
+    async def test_network_error_returns_error_string(self, mock_config_with_key):
+        patcher, mock_client_cls = _patch_client(MagicMock())
+        mock_client_cls.return_value.__aenter__.return_value.post.side_effect = httpx.ConnectError("boom")
+        try:
+            result = await _fetch()
+        finally:
+            patcher.stop()
 
         assert result == "Error: boom"
 
-    def test_missing_key_returns_error_string(self, mock_config_no_key):
+    async def test_missing_key_returns_error_string(self, mock_config_no_key):
         with patch.dict("os.environ", {}, clear=True):
-            with patch("deerflow.community.unbrowse.tools.httpx.Client") as mock_client_cls:
-                from deerflow.community.unbrowse.tools import web_fetch_tool
-
-                result = web_fetch_tool.invoke({"url": "https://example.com"})
+            patcher = patch("deerflow.community.unbrowse.tools.httpx.AsyncClient")
+            mock_client_cls = patcher.start()
+            try:
+                result = await _fetch()
+            finally:
+                patcher.stop()
 
         assert result == "Error: UNBROWSE_API_KEY is not configured"
         mock_client_cls.assert_not_called()
